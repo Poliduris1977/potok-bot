@@ -250,11 +250,6 @@ async def telegram_webhook(request: Request) -> Response:
 
 @app.post("/webhook/max")
 async def max_webhook(request: Request) -> Response:
-    if settings.max_webhook_secret:
-        token = request.headers.get("X-Max-Webhook-Secret", "")
-        if not _verify_secret(token, settings.max_webhook_secret):
-            logger.warning("[WEBHOOK] MAX: неверная подпись, IP=%s", _client_ip(request))
-            return Response(status_code=404)
 
     try:
         body: dict[str, Any] = await request.json()
