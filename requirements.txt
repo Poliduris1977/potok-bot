@@ -1,0 +1,16 @@
+# requirements.txt
+# Web framework
+fastapi==0.115.5
+uvicorn[standard]==0.32.1
+# Settings
+pydantic-settings==2.6.1
+# Database
+asyncpg==0.30.0
+# HTTP клиент (GigaChat, Макс API, установка webhook'ов)
+aiohttp==3.11.7
+# OpenAI-совместимый клиент (DeepSeek через OpenRouter)
+openai==1.82.0
+# Telegram
+python-telegram-bot==21.7
+# Утилиты
+python-dotenv==1.0.1
