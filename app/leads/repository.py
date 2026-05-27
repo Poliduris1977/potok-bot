@@ -184,3 +184,61 @@ async def delete_lead_cascade(pool, lead_id: int) -> bool:
 
     logger.info("[REPO] Лид %d каскадно удалён (152-ФЗ)", lead_id)
     return True
+
+
+# ── Удаление устаревших ПДн (152-ФЗ, плановая очистка) ───────────────────────
+
+async def delete_expired_leads(pool, retention_days: int) -> int:
+    """
+    Каскадно удалить лиды старше retention_days дней (по updated_at).
+
+    Критерий: лид не обновлялся дольше срока хранения.
+    Статус 'transferred' не влияет — данные всё равно подлежат удалению.
+
+    Returns:
+        Количество удалённых лидов.
+    """
+    async with pool.acquire(timeout=30.0) as conn:
+        async with conn.transaction():
+
+            # Собираем ID устаревших лидов
+            expired_ids = await conn.fetch(
+                """SELECT id FROM leads
+                   WHERE updated_at < NOW() - ($1 || ' days')::interval""",
+                str(retention_days)
+            )
+
+            if not expired_ids:
+                return 0
+
+            ids = [row["id"] for row in expired_ids]
+
+            # Каскадное удаление в правильном порядке
+            await conn.execute(
+                """DELETE FROM messages
+                   WHERE dialog_id IN (
+                       SELECT id FROM dialogs WHERE lead_id = ANY($1)
+                   )""",
+                ids
+            )
+
+            await conn.execute(
+                "DELETE FROM dialogs WHERE lead_id = ANY($1)",
+                ids
+            )
+
+            await conn.execute(
+                "DELETE FROM appointments WHERE lead_id = ANY($1)",
+                ids
+            )
+
+            await conn.execute(
+                "DELETE FROM leads WHERE id = ANY($1)",
+                ids
+            )
+
+    logger.info(
+        "[REPO] Плановая очистка ПДн: удалено %d лидов старше %d дней (152-ФЗ)",
+        len(ids), retention_days
+    )
+    return len(ids)

@@ -16,6 +16,7 @@
 #   — lifespan: пул БД закрывается в finally — нет утечки ресурсов при сбое
 #   — Telegram error не раскрывается клиенту — только в лог
 #   — Дедупликация webhook по update_id — защита от дублей при медленном LLM
+#   — Плановая очистка ПДн каждые 24ч (152-ФЗ) — срок задаётся PDN_RETENTION_DAYS
 
 from __future__ import annotations
 
@@ -84,6 +85,42 @@ async def _cleanup_rate_buckets() -> None:
         raise
 
 
+# ── Плановая очистка ПДн (152-ФЗ) ────────────────────────────────────────────
+
+_PDN_INTERVAL = 24 * 60 * 60  # раз в 24 часа
+
+
+async def _cleanup_pdn() -> None:
+    """
+    Фоновая задача: каждые 24 часа удаляет лиды старше PDN_RETENTION_DAYS дней.
+    Срок хранения задаётся в .env: PDN_RETENTION_DAYS=180 (по умолчанию).
+    """
+    logger.info(
+        "[PDN] Плановая очистка ПДн запущена (срок хранения: %d дней, интервал: 24ч)",
+        settings.pdn_retention_days,
+    )
+    try:
+        while True:
+            await asyncio.sleep(_PDN_INTERVAL)
+            try:
+                from app.leads.repository import delete_expired_leads
+                from app.database import get_pool
+
+                deleted = await delete_expired_leads(get_pool(), settings.pdn_retention_days)
+
+                if deleted:
+                    logger.info("[PDN] Удалено %d устаревших лидов (152-ФЗ)", deleted)
+                else:
+                    logger.debug("[PDN] Устаревших лидов не найдено")
+
+            except Exception as e:
+                logger.error("[PDN] Ошибка очистки ПДн: %s — %s", type(e).__name__, e)
+
+    except asyncio.CancelledError:
+        logger.info("[PDN] Плановая очистка ПДн остановлена (shutdown)")
+        raise
+
+
 # ── Вспомогательные функции ───────────────────────────────────────────────────
 
 def _client_ip(request: Request) -> str:
@@ -149,7 +186,8 @@ async def lifespan(app: FastAPI):
     from app.ai.session import start_cleanup
     start_cleanup()
     _background_tasks.append(asyncio.create_task(_cleanup_rate_buckets()))
-    logger.info("✅ Фоновые задачи запущены")
+    _background_tasks.append(asyncio.create_task(_cleanup_pdn()))
+    logger.info("✅ Фоновые задачи запущены (rate limiter + PDN cleanup)")
 
     yield
 
