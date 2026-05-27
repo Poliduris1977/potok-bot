@@ -21,16 +21,22 @@
 #   — get_session вызывается один раз за вызов depersonalize()
 #   — Лимит длины сообщения MAX_MESSAGE_LEN — защита от ReDoS
 #   — При переполнении pii_map выбрасывается RuntimeError → возврат пустой строки
+#
+# Redis-адаптация:
+#   — get_session и add_pii теперь async.
+#   — depersonalize / personalize / depersonalize_history тоже async.
+#   — Внутри re.sub работаем с локальной копией pii_map — re.sub не поддерживает
+#     async callback, поэтому сессия загружается ДО вызова sub, а запись
+#     накапливается в локальном dict и сохраняется в Redis одним вызовом после.
 
 from __future__ import annotations
 
-import hashlib
 import logging
 import re
 import unicodedata
 from typing import NamedTuple
 
-from app.ai.session import add_pii, get_session
+from app.ai.session import get_session, add_pii
 from app.utils import hash_uid
 
 logger = logging.getLogger(__name__)
@@ -73,7 +79,6 @@ _ADDRESS_FLAT = re.compile(
 )
 
 # Серия и номер паспорта — только с контекстным словом рядом.
-# Без контекста \b\d{4}\s?\d{6}\b матчит бюджет "1500 000000" и артикулы.
 _PASSPORT = re.compile(
     r'(?:паспорт|серия|документ|паспортные\s+данные)'
     r'[^\d]{0,20}\d{4}[\s\-]?\d{6}',
@@ -88,7 +93,6 @@ _NAME_CONTEXT = re.compile(
 )
 
 # Порядок важен: сначала специфичные (паспорт, телефон), потом общие.
-# Имя — последним: самый осторожный паттерн.
 _PATTERNS: list[_Pattern] = [
     _Pattern(_PASSPORT,        "ПАСПОРТ", False),
     _Pattern(_PHONE,           "ТЕЛЕФОН", False),
@@ -107,16 +111,13 @@ def _normalize(text: str) -> str:
     Заменяет все нестандартные пробелы на обычный —
     защищает от обхода паттернов через \u00a0, \u202f и т.д.
     """
-    # Заменяем Unicode-пробелы на обычный пробел
     text = re.sub(r'[\u00a0\u202f\u2009\u200b\u2060\u3000\ufeff]', ' ', text)
-    # NFKC нормализация — разворачивает лигатуры и fullwidth символы
     return unicodedata.normalize('NFKC', text)
 
 
 def mask_for_log(value: str) -> str:
     """
     Маскировать персональные данные для безопасного вывода в лог.
-    Используется в tools.py и других модулях где логируются данные клиента.
 
     Примеры:
         "Андрей"             → "Ан***ей"
@@ -134,10 +135,10 @@ def mask_for_log(value: str) -> str:
 
 # ── Публичный интерфейс ───────────────────────────────────────────────────────
 
-def depersonalize(user_id: str, text: str) -> str:
+async def depersonalize(user_id: str, text: str) -> str:
     """
     Заменить ПД в тексте на пронумерованные токены.
-    Маппинг токен→оригинал сохраняется в SESSION_CACHE[user_id]['pii_map'].
+    Маппинг токен→оригинал сохраняется в Redis (SESSION_CACHE[user_id]['pii_map']).
 
     Пример:
         "Меня зовут Андрей, тел. +7 921 111-22-33"
@@ -145,11 +146,15 @@ def depersonalize(user_id: str, text: str) -> str:
 
     При переполнении pii_map (50 записей) выбрасывается RuntimeError,
     перехватывается и возвращается пустая строка — DeepSeek не получает ПД.
+
+    Стратегия работы с Redis:
+    — Загружаем сессию один раз ДО re.sub.
+    — Внутри _replacer работаем только с локальным pii_map (синхронно).
+    — Новые записи накапливаем в pending_pii и сохраняем в Redis после sub.
     """
     if not text or not text.strip():
         return text
 
-    # Защита от ReDoS — обрезаем сверхдлинные сообщения
     if len(text) > MAX_MESSAGE_LEN:
         logger.warning(
             "[DEPERSONALIZE] user=%s сообщение обрезано %d→%d символов",
@@ -157,21 +162,31 @@ def depersonalize(user_id: str, text: str) -> str:
         )
         text = text[:MAX_MESSAGE_LEN]
 
-    # Unicode-нормализация — защита от обхода паттернов
     text = _normalize(text)
 
-    # Загружаем сессию один раз за весь вызов
-    session = get_session(user_id)
+    # Загружаем сессию один раз — pii_map работает как локальный кэш
+    session = await get_session(user_id)
     pii_map = session["pii_map"]
 
     # Обратный индекс value→token для O(1) поиска дублей
     reverse: dict[str, str] = {v: k for k, v in pii_map.items()}
 
+    # Новые записи накапливаем здесь — добавим в Redis после всех sub
+    pending_pii: dict[str, str] = {}  # token → original
+
+    overflow = False
+
     try:
         for pat in _PATTERNS:
-            def _replacer(match: re.Match,
-                          _label: str = pat.label,
-                          _is_group: bool = pat.is_group) -> str:
+            if overflow:
+                break
+
+            def _replacer(
+                match: re.Match,
+                _label: str = pat.label,
+                _is_group: bool = pat.is_group,
+            ) -> str:
+                nonlocal overflow
                 try:
                     original = match.group(1) if _is_group else match.group(0)
                     if not original or not original.strip():
@@ -184,29 +199,35 @@ def depersonalize(user_id: str, text: str) -> str:
                             return match.group(0).replace(original, token, 1)
                         return token
 
-                    # Новый токен: max(существующих индексов) + 1 — защита от коллизий
+                    # Проверяем лимит (pii_map + pending)
+                    total = len(pii_map) + len(pending_pii)
+                    from app.ai.session import MAX_PII_ENTRIES
+                    if total >= MAX_PII_ENTRIES:
+                        logger.warning(
+                            "[DEPERSONALIZE] pii_map переполнен user=%s, %s не заменён",
+                            hash_uid(user_id), _label,
+                        )
+                        overflow = True
+                        raise RuntimeError(
+                            "pii_map переполнен — передача в DeepSeek заблокирована"
+                        )
+
+                    # Новый токен
                     prefix   = f"[{_label}_"
                     existing = [
-                        int(k[len(prefix):-1]) for k in pii_map
+                        int(k[len(prefix):-1])
+                        for k in list(pii_map) + list(pending_pii)
                         if k.startswith(prefix) and k[len(prefix):-1].isdigit()
                     ]
                     n     = (max(existing) + 1) if existing else 0
                     token = f"[{_label}_{n}]"
 
-                    if add_pii(user_id, token, original):
-                        reverse[original] = token
-                        logger.debug(
-                            "[DEPERSONALIZE] user=%s %s обнаружен",
-                            hash_uid(user_id), _label,
-                        )
-                    else:
-                        logger.warning(
-                            "[DEPERSONALIZE] pii_map переполнен user=%s, %s не заменён",
-                            hash_uid(user_id), _label,
-                        )
-                        raise RuntimeError(
-                            f"pii_map переполнен для пользователя — передача в DeepSeek заблокирована"
-                        )
+                    pending_pii[token] = original
+                    reverse[original]  = token
+                    logger.debug(
+                        "[DEPERSONALIZE] user=%s %s обнаружен",
+                        hash_uid(user_id), _label,
+                    )
 
                     if _is_group:
                         return match.group(0).replace(original, token, 1)
@@ -223,14 +244,22 @@ def depersonalize(user_id: str, text: str) -> str:
                     return match.group(0)
 
             text = pat.regex.sub(_replacer, text)
+
     except RuntimeError as e:
         logger.error("[DEPERSONALIZE] user=%s %s", hash_uid(user_id), str(e))
+        # Сохраняем то что успели накопить до переполнения
+        for token, original in pending_pii.items():
+            await add_pii(user_id, token, original)
         return ""
+
+    # Сохраняем все новые записи в Redis
+    for token, original in pending_pii.items():
+        await add_pii(user_id, token, original)
 
     return text
 
 
-def personalize(user_id: str, text: str) -> str:
+async def personalize(user_id: str, text: str) -> str:
     """
     Восстановить оригинальные ПД из токенов.
     Вызывается после получения ответа от DeepSeek перед записью в БД.
@@ -242,7 +271,7 @@ def personalize(user_id: str, text: str) -> str:
     if not text or not text.strip():
         return text
 
-    session = get_session(user_id)
+    session = await get_session(user_id)
     pii_map = session["pii_map"]
 
     if not pii_map:
@@ -256,7 +285,7 @@ def personalize(user_id: str, text: str) -> str:
     return result
 
 
-def depersonalize_history(user_id: str, messages: list[dict]) -> list[dict]:
+async def depersonalize_history(user_id: str, messages: list[dict]) -> list[dict]:
     """
     Деперсонализировать историю сообщений перед отправкой в DeepSeek.
 
@@ -272,7 +301,7 @@ def depersonalize_history(user_id: str, messages: list[dict]) -> list[dict]:
         if msg.get("role") == "user":
             result.append({
                 **msg,
-                "content": depersonalize(user_id, msg.get("content") or ""),
+                "content": await depersonalize(user_id, msg.get("content") or ""),
             })
         else:
             result.append(msg)

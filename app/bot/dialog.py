@@ -37,7 +37,7 @@ async def process_message(msg: IncomingMessage) -> str:
     if command == "/start":
         # Сбрасываем SESSION_CACHE — новый диалог начинается чисто
         from app.ai.session import reset_session
-        reset_session(f"{msg.platform}:{msg.user_id}")
+        await reset_session(f"{msg.platform}:{msg.user_id}")
         return _GREETING.format(
             bot_name=settings.bot_name,
             company=settings.company_name,

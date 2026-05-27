@@ -58,6 +58,7 @@ class Settings(BaseSettings):
 
     # ── Database ──────────────────────────────────────────────────────────────
     database_url: str = ""
+    redis_url:    str = "redis://redis:6379/0"
 
     # ── Уведомления ───────────────────────────────────────────────────────────
     director_chat_id: Optional[int] = None

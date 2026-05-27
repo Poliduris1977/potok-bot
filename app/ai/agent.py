@@ -135,13 +135,13 @@ def _fallback_reply() -> str:
     )
 
 
-def _maybe_personalize(session_key: str, text: str) -> str:
+async def _maybe_personalize(session_key: str, text: str) -> str:
     """
     Восстановить оригинальные ПД из токенов — только для DeepSeek-ответов.
     GigaChat получает оригинальные данные, токенов в ответе быть не может.
     """
-    if get_provider(session_key) == "deepseek":
-        return personalize(session_key, text)
+    if await get_provider(session_key) == "deepseek":
+        return await personalize(session_key, text)
     return text
 
 
@@ -212,11 +212,11 @@ async def _call_provider(
             "message": {"content": _fallback_reply()},
         }
 
-    provider = get_provider(session_key)
+    provider = await get_provider(session_key)
 
     try:
         if provider == "deepseek":
-            safe_messages = depersonalize_history(session_key, messages)
+            safe_messages = await depersonalize_history(session_key, messages)
             try:
                 return await deepseek_client.chat(
                     messages=safe_messages,
@@ -229,7 +229,7 @@ async def _call_provider(
                     "[FALLBACK] DeepSeek→GigaChat | session=%s | %s",
                     session_key, type(e).__name__,
                 )
-                set_provider(session_key, "gigachat")
+                await set_provider(session_key, "gigachat")
                 return await gigachat_client.chat(
                     messages=messages,
                     system_prompt=system_prompt,
@@ -348,7 +348,7 @@ async def _run_agent_inner(
             if not tool_calls:
                 logger.warning("Agent: tool_calls пустой список | session=%s", session_key)
                 if content:
-                    return _maybe_personalize(session_key, content), ctx.to_result()
+                    return await _maybe_personalize(session_key, content), ctx.to_result()
                 return _fallback_reply(), ctx.to_result()
 
             called: list[str] = []
@@ -398,14 +398,14 @@ async def _run_agent_inner(
             working_messages = _rebuild_messages(context_messages, history_messages, fc_trail)
 
             if remaining_text:
-                reply = _maybe_personalize(session_key, remaining_text)
+                reply = await _maybe_personalize(session_key, remaining_text)
                 logger.info("Agent done in %d iter (FC-B+text)", iteration + 1)
                 return reply, ctx.to_result()
             continue
 
         # ── Option C: текстовый ответ ─────────────────────────────────────────
         if content:
-            reply = _maybe_personalize(session_key, content)
+            reply = await _maybe_personalize(session_key, content)
             logger.info("Agent done in %d iter (text)", iteration + 1)
             return reply, ctx.to_result()
 

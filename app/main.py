@@ -155,8 +155,9 @@ async def lifespan(app: FastAPI):
 
     logger.info("🛑 ПОТОК-бот останавливается...")
 
-    from app.ai.session import stop_cleanup
+    from app.ai.session import stop_cleanup, close_redis
     stop_cleanup()
+    await close_redis()
 
     for task in _background_tasks:
         if not task.done():

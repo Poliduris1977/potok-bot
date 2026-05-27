@@ -14,3 +14,4 @@ openai==1.82.0
 python-telegram-bot==21.7
 # Утилиты
 python-dotenv==1.0.1
+redis[asyncio]>=5.0.0

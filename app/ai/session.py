@@ -1,140 +1,148 @@
 # app/ai/session.py
-# SESSION_CACHE — хранилище состояния диалогов в оперативной памяти.
+# SESSION_CACHE — хранилище состояния диалогов в Redis.
 #
-# Хранит per user_id:
+# Хранит per user_id (JSON, TTL 30 минут):
 #   provider    — активный провайдер ("deepseek" | "gigachat")
 #   pii_map     — маппинг плейсхолдер → оригинальные персональные данные
-#   last_active — unix timestamp последнего обращения (обновляется автоматически)
 #
-# TTL:     30 минут с момента последнего обращения.
-# Очистка: фоновая asyncio-задача каждые 5 минут.
+# TTL сбрасывается при каждом обращении (скользящее окно).
+# Очистка: Redis сам удаляет ключи по TTL — start_cleanup/stop_cleanup — no-op.
 #
-# ⚠️  MVP: данные хранятся в оперативной памяти.
-#     До продакшн-масштабирования — обязательно заменить на Redis.
-#     In-memory не переживает перезапуск и не масштабируется горизонтально.
+# Ключ в Redis: session:{user_id}
 
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import time
 from typing import TypedDict
 
+import redis.asyncio as aioredis
+
+from app.config import settings
 from app.utils import hash_uid
 
 logger = logging.getLogger(__name__)
 
 # ── Константы ─────────────────────────────────────────────────────────────────
 
-SESSION_TTL      = 30 * 60   # 30 минут в секундах
-CLEANUP_INTERVAL =  5 * 60   # интервал проверки — каждые 5 минут
-MAX_SESSIONS     = 10_000    # предел кэша — предупреждение в лог
-MAX_PII_ENTRIES  = 50        # предел записей в pii_map на одну сессию
+SESSION_TTL     = 30 * 60   # 30 минут в секундах
+MAX_PII_ENTRIES = 50        # предел записей в pii_map на одну сессию
 
 VALID_PROVIDERS = frozenset({"deepseek", "gigachat"})
 
 # ── Типы ──────────────────────────────────────────────────────────────────────
 
 class Session(TypedDict):
-    provider:    str              # "deepseek" | "gigachat"
-    pii_map:     dict[str, str]   # плейсхолдер → оригинальное значение
-    last_active: float            # unix timestamp
+    provider: str            # "deepseek" | "gigachat"
+    pii_map:  dict[str, str] # плейсхолдер → оригинальное значение
 
 
-# ── Хранилище ─────────────────────────────────────────────────────────────────
+# ── Redis клиент ──────────────────────────────────────────────────────────────
 
-SESSION_CACHE: dict[str, Session] = {}
+_redis: aioredis.Redis | None = None
 
-# Ссылка на фоновую задачу — нужна для отмены при shutdown
-_cleanup_task: asyncio.Task | None = None
+
+def _get_redis() -> aioredis.Redis:
+    global _redis
+    if _redis is None:
+        _redis = aioredis.from_url(
+            settings.redis_url,
+            encoding="utf-8",
+            decode_responses=True,
+        )
+    return _redis
+
+
+async def close_redis() -> None:
+    """Закрыть соединение с Redis. Вызывать в lifespan при shutdown."""
+    global _redis
+    if _redis is not None:
+        await _redis.aclose()
+        _redis = None
+        logger.info("[SESSION] Redis соединение закрыто")
+
+
+# ── Внутренние хелперы ────────────────────────────────────────────────────────
+
+def _key(user_id: str) -> str:
+    return f"session:{user_id}"
+
+
+async def _load(user_id: str) -> Session | None:
+    """Загрузить сессию из Redis. None если не существует."""
+    try:
+        raw = await _get_redis().get(_key(user_id))
+        if raw is None:
+            return None
+        data = json.loads(raw)
+        return Session(
+            provider=data.get("provider", "deepseek"),
+            pii_map=data.get("pii_map", {}),
+        )
+    except Exception as e:
+        logger.error("[SESSION] Ошибка чтения из Redis: %s", type(e).__name__)
+        return None
+
+
+async def _save(user_id: str, session: Session) -> None:
+    """Сохранить сессию в Redis с обновлением TTL."""
+    try:
+        await _get_redis().setex(
+            _key(user_id),
+            SESSION_TTL,
+            json.dumps({"provider": session["provider"], "pii_map": session["pii_map"]}),
+        )
+    except Exception as e:
+        logger.error("[SESSION] Ошибка записи в Redis: %s", type(e).__name__)
+
+
+async def _default_session() -> Session:
+    return Session(provider="deepseek", pii_map={})
 
 
 # ── Публичный интерфейс ───────────────────────────────────────────────────────
 
-def _evict_oldest() -> None:
-    """
-    Вытеснить одну самую старую сессию из кэша (LRU eviction).
-    Вызывается когда SESSION_CACHE достиг MAX_SESSIONS.
-    Защищает от бесконтрольного роста памяти при DDoS или высокой нагрузке.
-    """
-    if not SESSION_CACHE:
-        return
-    oldest_uid = min(SESSION_CACHE, key=lambda uid: SESSION_CACHE[uid].get("last_active", 0))
-    if oldest_uid in SESSION_CACHE:
-        SESSION_CACHE[oldest_uid]["pii_map"].clear()   # явное уничтожение ПД (152-ФЗ ст. 21)
-    SESSION_CACHE.pop(oldest_uid, None)
-    logger.warning("[SESSION] LRU eviction: вытеснена сессия user=%s", hash_uid(oldest_uid))
-
-
-def get_session(user_id: str) -> Session:
+async def get_session(user_id: str) -> Session:
     """
     Вернуть сессию для пользователя.
-    Если сессии нет — создать с дефолтными значениями (DeepSeek, пустой pii_map).
-    last_active обновляется автоматически при каждом обращении.
-
-    При достижении MAX_SESSIONS вытесняет наиболее старую сессию (LRU)
-    вместо того чтобы расти бесконечно.
+    Если сессии нет — создать с дефолтными значениями.
+    TTL обновляется при каждом обращении.
     """
-    if user_id not in SESSION_CACHE:
-        if len(SESSION_CACHE) >= MAX_SESSIONS:
-            logger.warning(
-                "[SESSION] Кэш достиг предела %d сессий — вытесняем старейшую. "
-                "Рассмотрите переход на Redis.",
-                MAX_SESSIONS,
-            )
-            _evict_oldest()
-
-        SESSION_CACHE[user_id] = Session(
-            provider="deepseek",
-            pii_map={},
-            last_active=time.time(),
-        )
-    else:
-        # Обновляем last_active при каждом обращении — отдельный touch не нужен
-        SESSION_CACHE[user_id]["last_active"] = time.time()
-
-    return SESSION_CACHE[user_id]
+    session = await _load(user_id)
+    if session is None:
+        session = await _default_session()
+    await _save(user_id, session)  # обновляем TTL
+    return session
 
 
-def get_session_or_none(user_id: str) -> Session | None:
-    """
-    Вернуть сессию без создания и без обновления last_active.
-    Используется для read-only проверок (мониторинг, отладка).
-    """
-    return SESSION_CACHE.get(user_id)
-
-
-def get_provider(user_id: str) -> str:
-    """
-    Вернуть активный провайдер для пользователя.
-    Если сессии нет или значение некорректно — возвращает 'deepseek'.
-    """
-    session = SESSION_CACHE.get(user_id)
+async def get_provider(user_id: str) -> str:
+    """Вернуть активный провайдер. Если нет сессии — 'deepseek'."""
+    session = await _load(user_id)
     if not session:
         return "deepseek"
     provider = session.get("provider", "deepseek")
     return provider if provider in VALID_PROVIDERS else "deepseek"
 
 
-def set_provider(user_id: str, provider: str) -> None:
-    """
-    Переключить провайдера (вызывается при fallback на GigaChat).
-    Создаёт сессию если её нет.
-    """
+async def set_provider(user_id: str, provider: str) -> None:
+    """Переключить провайдера (вызывается при fallback на GigaChat)."""
     if provider not in VALID_PROVIDERS:
         logger.error("[SESSION] Неизвестный провайдер: %s", provider)
         return
-    session = get_session(user_id)
+    session = await get_session(user_id)
     session["provider"] = provider
+    await _save(user_id, session)
     logger.info("[SESSION] user=%s provider→%s", hash_uid(user_id), provider)
 
 
-def add_pii(user_id: str, token: str, original: str) -> bool:
+async def add_pii(user_id: str, token: str, original: str) -> bool:
     """
     Добавить запись в pii_map.
     Возвращает False если достигнут лимит MAX_PII_ENTRIES.
     """
-    session = get_session(user_id)
+    session = await get_session(user_id)
     pii_map = session["pii_map"]
 
     if len(pii_map) >= MAX_PII_ENTRIES:
@@ -145,92 +153,36 @@ def add_pii(user_id: str, token: str, original: str) -> bool:
         return False
 
     pii_map[token] = original
+    await _save(user_id, session)
     return True
 
 
-def reset_session(user_id: str) -> None:
+async def reset_session(user_id: str) -> None:
     """Полностью сбросить сессию (например, при команде /start)."""
-    if user_id in SESSION_CACHE:
-        SESSION_CACHE[user_id]["pii_map"].clear()   # явное уничтожение ПД (152-ФЗ ст. 21)
-    SESSION_CACHE.pop(user_id, None)
-    logger.debug("[SESSION] Сессия сброшена: user=%s", hash_uid(user_id))
-
-
-def session_stats() -> dict:
-    """
-    Статистика кэша для health-check и мониторинга.
-    Не обновляет last_active.
-    """
-    sessions = list(SESSION_CACHE.values())
-    now      = time.time()
-    return {
-        "total":    len(sessions),
-        "deepseek": sum(1 for s in sessions if s.get("provider") == "deepseek"),
-        "gigachat": sum(1 for s in sessions if s.get("provider") == "gigachat"),
-        "expiring": sum(                                   # >24 мин неактивности
-            1 for s in sessions
-            if now - s.get("last_active", 0) > SESSION_TTL * 0.8
-        ),
-        "capacity": MAX_SESSIONS,
-    }
-
-
-# ── Фоновая очистка ───────────────────────────────────────────────────────────
-
-async def cleanup_sessions() -> None:
-    """
-    Фоновая asyncio-задача. Удаляет сессии старше SESSION_TTL.
-    Запускается через start_cleanup() в lifespan main.py.
-    Корректно завершается при отмене задачи (CancelledError).
-    """
-    logger.info(
-        "[SESSION] Фоновая очистка запущена (TTL=%ds, интервал=%ds)",
-        SESSION_TTL, CLEANUP_INTERVAL,
-    )
     try:
-        while True:
-            await asyncio.sleep(CLEANUP_INTERVAL)
-            try:
-                now     = time.time()
-                expired = [
-                    uid for uid, data in list(SESSION_CACHE.items())
-                    if now - data.get("last_active", 0) > SESSION_TTL
-                ]
-                for uid in expired:
-                    if uid in SESSION_CACHE:
-                        SESSION_CACHE[uid]["pii_map"].clear()  # явное уничтожение ПД (152-ФЗ ст. 21)
-                    SESSION_CACHE.pop(uid, None)
-                if expired:
-                    logger.info("[SESSION] Очищено %d сессий", len(expired))
-            except Exception as e:
-                # Используем error вместо exception — полный трейсбек может
-                # содержать pii_map с персональными данными клиентов
-                logger.error(
-                    "[SESSION] Ошибка в цикле очистки: %s", type(e).__name__
-                )
+        # Явное уничтожение ПД перед удалением ключа (152-ФЗ ст. 21)
+        session = await _load(user_id)
+        if session:
+            session["pii_map"].clear()
+            await _save(user_id, session)
+        await _get_redis().delete(_key(user_id))
+        logger.debug("[SESSION] Сессия сброшена: user=%s", hash_uid(user_id))
+    except Exception as e:
+        logger.error("[SESSION] Ошибка сброса сессии: %s", type(e).__name__)
 
-    except asyncio.CancelledError:
-        logger.info("[SESSION] Фоновая очистка остановлена (shutdown)")
-        raise  # пробрасываем — asyncio ожидает CancelledError при отмене задачи
 
+async def get_session_or_none(user_id: str) -> Session | None:
+    """Вернуть сессию без создания и без обновления TTL."""
+    return await _load(user_id)
+
+
+# ── Совместимость с lifespan ──────────────────────────────────────────────────
+# start_cleanup / stop_cleanup — no-op: Redis сам удаляет ключи по TTL.
+# Оставлены чтобы не менять main.py.
 
 def start_cleanup() -> None:
-    """
-    Запустить фоновую задачу очистки и сохранить ссылку для отмены.
-    Вызывать в lifespan main.py при старте приложения.
-    """
-    global _cleanup_task
-    _cleanup_task = asyncio.create_task(cleanup_sessions())
-    logger.info("[SESSION] Задача очистки создана")
+    logger.info("[SESSION] Redis-режим: TTL-очистка на стороне Redis, задача не нужна")
 
 
 def stop_cleanup() -> None:
-    """
-    Отменить фоновую задачу очистки.
-    Вызывать в lifespan main.py при остановке приложения.
-    """
-    global _cleanup_task
-    if _cleanup_task and not _cleanup_task.done():
-        _cleanup_task.cancel()
-        logger.info("[SESSION] Задача очистки отменена")
-    _cleanup_task = None
+    pass

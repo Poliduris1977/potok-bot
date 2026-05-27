@@ -1,4 +1,4 @@
-# docker-compose.yml — ПОТОК v1.0.1
+# docker-compose.yml — ПОТОК v1.0.2
 services:
   app:
     build: .
@@ -9,6 +9,19 @@ services:
     depends_on:
       db:
         condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: redis-server --save "" --appendonly no
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
   db:
     image: postgres:15-alpine
     restart: unless-stopped
@@ -25,5 +38,6 @@ services:
       interval: 5s
       timeout: 5s
       retries: 5
+
 volumes:
   pgdata:
